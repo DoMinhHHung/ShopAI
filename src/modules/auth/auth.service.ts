@@ -1,13 +1,12 @@
 import {
   Injectable, BadRequestException, UnauthorizedException,
-  ConflictException, NotFoundException,
+  ConflictException, NotFoundException, ForbiddenException,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import * as bcrypt from 'bcryptjs';
 import * as admin from 'firebase-admin';
 import { Inject } from '@nestjs/common';
-
 import { RedisService } from '../../shared/redis/redis.service';
 import { MailService } from '../../shared/mail/mail.service';
 import { RegisterDto } from './dto/register.dto';
@@ -16,6 +15,7 @@ import { VerifyOtpDto } from './dto/verify-otp.dto';
 import { ForgotPasswordDto } from './dto/forgot-password.dto';
 import { ResetPasswordDto } from './dto/reset-password.dto';
 import { ResendOtpDto } from './dto/resend-otp.dto';
+import { RefreshTokenDto } from './dto/refresh-token.dto';
 
 @Injectable()
 export class AuthService {
@@ -31,22 +31,37 @@ export class AuthService {
     this.db = firebaseApp.firestore();
   }
 
-  // ─── HELPER ───────────────────────────────────────────
+  // ─── HELPERS ──────────────────────────────────────────────────────────────
+
   private generateOtp(): string {
     return Math.floor(100000 + Math.random() * 900000).toString();
   }
 
-  private generateJwt(userId: string, email: string, role: string) {
-    return this.jwtService.sign(
-      { sub: userId, email, role },
-      {
-        secret: this.config.get('JWT_SECRET'),
-        expiresIn: this.config.get('JWT_EXPIRES_IN'),
-      },
-    );
+  /** Tạo cặp accessToken + refreshToken */
+  private generateTokens(userId: string, email: string, role: string) {
+    const payload = { sub: userId, email, role };
+
+    const accessToken = this.jwtService.sign(payload, {
+      secret: this.config.get('JWT_ACCESS_SECRET'),
+      expiresIn: this.config.get('JWT_ACCESS_EXPIRES'), // 15m
+    });
+
+    const refreshToken = this.jwtService.sign(payload, {
+      secret: this.config.get('JWT_REFRESH_SECRET'),
+      expiresIn: this.config.get('JWT_REFRESH_EXPIRES'), // 7d
+    });
+
+    return { accessToken, refreshToken };
   }
 
-  // ─── REGISTER ─────────────────────────────────────────
+  /** Lưu refresh token vào Redis (TTL = 7 ngày) */
+  private async saveRefreshToken(userId: string, refreshToken: string) {
+    const ttl = 7 * 24 * 60 * 60; // 7 ngày tính bằng giây
+    await this.redisService.setRefreshToken(userId, refreshToken, ttl);
+  }
+
+  // ─── REGISTER ─────────────────────────────────────────────────────────────
+
   async register(dto: RegisterDto) {
     const existing = await this.db.collection('users')
       .where('email', '==', dto.email).limit(1).get();
@@ -63,7 +78,7 @@ export class AuthService {
       name: dto.name,
       email: dto.email,
       password: hashedPassword,
-      role: dto.role,
+      role: 'buyer',          // ✅ Mặc định buyer
       isVerified: false,
       isActive: true,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -71,15 +86,13 @@ export class AuthService {
 
     const otp = this.generateOtp();
     await this.redisService.setOtp(dto.email, otp, 300);
-
     await this.mailService.sendOtpEmail(dto.email, otp, 'register');
 
-    return {
-      message: 'Đăng ký thành công! Vui lòng kiểm tra email để lấy OTP.',
-    };
+    return { message: 'Đăng ký thành công! Vui lòng kiểm tra email để lấy OTP.' };
   }
 
-  // ─── VERIFY OTP ───────────────────────────────────────
+  // ─── VERIFY OTP ───────────────────────────────────────────────────────────
+
   async verifyOtp(dto: VerifyOtpDto) {
     const storedOtp = await this.redisService.getOtp(dto.email);
 
@@ -90,11 +103,9 @@ export class AuthService {
       throw new BadRequestException('OTP không đúng.');
     }
 
-    // Xoá OTP sau khi dùng
     await this.redisService.deleteOtp(dto.email);
 
     if (dto.type === 'register') {
-      // Kích hoạt tài khoản
       const snapshot = await this.db.collection('users')
         .where('email', '==', dto.email).limit(1).get();
 
@@ -104,19 +115,22 @@ export class AuthService {
       await userDoc.ref.update({ isVerified: true });
       const user = userDoc.data();
 
-      const token = this.generateJwt(userDoc.id, user.email, user.role);
+      // ✅ Trả về cả 2 tokens sau khi verify
+      const tokens = this.generateTokens(userDoc.id, user.email, user.role);
+      await this.saveRefreshToken(userDoc.id, tokens.refreshToken);
+
       return {
         message: 'Xác thực thành công!',
-        accessToken: token,
+        ...tokens,
         user: { id: userDoc.id, name: user.name, email: user.email, role: user.role },
       };
     }
 
-    // type === 'reset' → chỉ xác nhận OTP, chưa đổi pass
     return { message: 'OTP hợp lệ. Hãy tiến hành đặt lại mật khẩu.' };
   }
 
-  // ─── LOGIN ────────────────────────────────────────────
+  // ─── LOGIN ────────────────────────────────────────────────────────────────
+
   async login(dto: LoginDto) {
     const snapshot = await this.db.collection('users')
       .where('email', '==', dto.email).limit(1).get();
@@ -131,37 +145,79 @@ export class AuthService {
     if (!user.isVerified) {
       throw new UnauthorizedException('Tài khoản chưa được xác thực. Vui lòng kiểm tra email.');
     }
+    if (!user.isActive) {
+      throw new ForbiddenException('Tài khoản đã bị khoá.');
+    }
 
     const isMatch = await bcrypt.compare(dto.password, user.password);
     if (!isMatch) {
       throw new UnauthorizedException('Email hoặc mật khẩu không đúng');
     }
 
-    const token = this.generateJwt(userDoc.id, user.email, user.role);
+    // ✅ Tạo cả 2 tokens
+    const tokens = this.generateTokens(userDoc.id, user.email, user.role);
+    await this.saveRefreshToken(userDoc.id, tokens.refreshToken);
+
     return {
       message: 'Đăng nhập thành công!',
-      accessToken: token,
+      ...tokens,
       user: { id: userDoc.id, name: user.name, email: user.email, role: user.role },
     };
   }
 
-  // ─── FORGOT PASSWORD ──────────────────────────────────
+
+  async refreshToken(dto: RefreshTokenDto) {
+    let payload: any;
+    try {
+      payload = this.jwtService.verify(dto.refreshToken, {
+        secret: this.config.get('JWT_REFRESH_SECRET'),
+      });
+    } catch {
+      throw new UnauthorizedException('Refresh token không hợp lệ hoặc đã hết hạn.');
+    }
+
+    const userId = payload.sub;
+
+    const storedToken = await this.redisService.getRefreshToken(userId);
+    if (!storedToken || storedToken !== dto.refreshToken) {
+      throw new UnauthorizedException('Refresh token đã bị thu hồi. Vui lòng đăng nhập lại.');
+    }
+
+    const userDoc = await this.db.collection('users').doc(userId).get();
+    if (!userDoc.exists) throw new NotFoundException('Tài khoản không tồn tại');
+
+    const user = userDoc.data();
+    if (!user) throw new NotFoundException('Không lấy được dữ liệu tài khoản');
+
+    const tokens = this.generateTokens(userId, user.email, user.role);
+    await this.saveRefreshToken(userId, tokens.refreshToken); 
+
+    return {
+      message: 'Làm mới token thành công!',
+      ...tokens,
+    };
+  }
+
+
+  async logout(userId: string) {
+    await this.redisService.deleteRefreshToken(userId);
+    return { message: 'Đăng xuất thành công!' };
+  }
+
+
   async forgotPassword(dto: ForgotPasswordDto) {
     const snapshot = await this.db.collection('users')
       .where('email', '==', dto.email).limit(1).get();
 
-    if (snapshot.empty) {
-      return { message: 'Nếu email tồn tại, OTP đã được gửi.' };
+    if (!snapshot.empty) {
+      const otp = this.generateOtp();
+      await this.redisService.setOtp(dto.email, otp, 300);
+      await this.mailService.sendOtpEmail(dto.email, otp, 'reset');
     }
 
-    const otp = this.generateOtp();
-    await this.redisService.setOtp(dto.email, otp, 300);
-    await this.mailService.sendOtpEmail(dto.email, otp, 'reset');
-
-    return { message: 'Nếu email tồn tại, OTP đã được gửi.' };
+    return { message: 'OTP đã được gửi.' };
   }
 
-  // ─── RESET PASSWORD ───────────────────────────────────
   async resetPassword(dto: ResetPasswordDto) {
     const storedOtp = await this.redisService.getOtp(dto.email);
 
@@ -178,14 +234,15 @@ export class AuthService {
     if (snapshot.empty) throw new NotFoundException('Tài khoản không tồn tại');
 
     const hashedPassword = await bcrypt.hash(dto.newPassword, 10);
-    await snapshot.docs[0].ref.update({ password: hashedPassword });
+    const userDoc = snapshot.docs[0];
 
+    await userDoc.ref.update({ password: hashedPassword });
     await this.redisService.deleteOtp(dto.email);
+    await this.redisService.deleteRefreshToken(userDoc.id);
 
     return { message: 'Đặt lại mật khẩu thành công! Hãy đăng nhập lại.' };
   }
 
-  // ─── RESEND OTP ───────────────────────────────────────
   async resendOtp(dto: ResendOtpDto) {
     const limited = await this.redisService.getResendLimit(dto.email);
     if (limited) {
@@ -193,8 +250,8 @@ export class AuthService {
     }
 
     const otp = this.generateOtp();
-    await this.redisService.setOtp(dto.email, otp, 300);          
-    await this.redisService.setResendLimit(dto.email, 60);        
+    await this.redisService.setOtp(dto.email, otp, 300);
+    await this.redisService.setResendLimit(dto.email, 60);
     await this.mailService.sendOtpEmail(dto.email, otp, dto.type);
 
     return { message: 'OTP mới đã được gửi vào email của bạn.' };

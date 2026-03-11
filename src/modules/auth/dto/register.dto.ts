@@ -14,8 +14,4 @@ export class RegisterDto {
   @IsString()
   @MinLength(6)
   password: string;
-
-  @ApiProperty({ enum: ['buyer', 'seller'], default: 'buyer' })
-  @IsEnum(['buyer', 'seller'])
-  role: 'buyer' | 'seller';
 }
