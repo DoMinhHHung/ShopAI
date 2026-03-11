@@ -33,5 +33,7 @@ async function bootstrap() {
   await app.listen(process.env.PORT ?? 3000);
   console.log(`🚀 Server running on http://localhost:${process.env.PORT ?? 3000}`);
   console.log(`📚 Swagger docs: http://localhost:${process.env.PORT ?? 3000}/api/docs`);
+  console.log('MAIL_USER:', process.env.MAIL_USER);
+console.log('MAIL_PASS:', process.env.MAIL_PASS);
 }
 bootstrap();

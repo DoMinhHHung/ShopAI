@@ -8,17 +8,21 @@ import { ProductsModule } from './modules/products/products.module';
 import { OrdersModule } from './modules/orders/orders.module';
 import { ChatModule } from './modules/chat/chat.module';
 import { AiModule } from './modules/ai/ai.module';
+import { RedisModule } from './shared/redis/redis.module';
+import { MailModule } from './shared/mail/mail.module';
 
 @Module({
   imports: [
     ConfigModule.forRoot({
       isGlobal: true,
-      envFilePath: ['.env'],
+      envFilePath: '.env',
     }),
 
     FirebaseModule,
     AuthModule,
     UsersModule,
+    RedisModule,
+    MailModule,
     ProductsModule,
     OrdersModule,
     ChatModule,
