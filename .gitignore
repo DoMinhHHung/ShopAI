@@ -1,4 +1,5 @@
 .env
+firebase-key.json
 
 # compiled output
 /dist
