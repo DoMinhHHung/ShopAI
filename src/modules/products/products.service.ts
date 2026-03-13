@@ -9,6 +9,8 @@ import * as admin from 'firebase-admin';
 import { CreateProductDto } from './dto/create-product.dto';
 import { UpdateProductDto } from './dto/update-product.dto';
 import { FilterProductsDto } from './dto/filter-products.dto';
+import { AddToCartDto } from './dto/add-to-cart.dto';
+import { UpdateCartItemDto } from './dto/update-cart-item.dto';
 
 @Injectable()
 export class ProductsService {
@@ -162,6 +164,173 @@ export class ProductsService {
     return {
       total: products.length,
       items: products,
+    };
+  }
+
+
+  async searchProducts(keyword: string, limit = 20) {
+    const filters: FilterProductsDto = {
+      keyword,
+      limit,
+      onlyActive: true,
+    };
+
+    return this.listProducts(filters);
+  }
+
+  async addToCart(userId: string, productId: string, dto: AddToCartDto) {
+    const product = await this.getProductById(productId);
+    if (!product.isActive) {
+      throw new BadRequestException('Sản phẩm đang tạm ẩn');
+    }
+
+    const quantity = dto.quantity ?? 1;
+    const cartRef = this.db
+      .collection('users')
+      .doc(userId)
+      .collection('cart')
+      .doc(productId);
+
+    const cartDoc = await cartRef.get();
+    if (cartDoc.exists) {
+      const current = cartDoc.data();
+      const nextQuantity = (current?.quantity ?? 0) + quantity;
+
+      await cartRef.update({
+        quantity: nextQuantity,
+        priceSnapshot: product.price,
+        productNameSnapshot: product.name,
+        imageSnapshot: product.imageUrls?.[0] ?? null,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      return { message: 'Đã cập nhật số lượng trong giỏ hàng' };
+    }
+
+    await cartRef.set({
+      productId,
+      quantity,
+      priceSnapshot: product.price,
+      productNameSnapshot: product.name,
+      imageSnapshot: product.imageUrls?.[0] ?? null,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    return { message: 'Đã thêm sản phẩm vào giỏ hàng' };
+  }
+
+  async updateCartItem(userId: string, productId: string, dto: UpdateCartItemDto) {
+    const cartRef = this.db
+      .collection('users')
+      .doc(userId)
+      .collection('cart')
+      .doc(productId);
+
+    const cartDoc = await cartRef.get();
+    if (!cartDoc.exists) throw new NotFoundException('Sản phẩm chưa có trong giỏ hàng');
+
+    await cartRef.update({
+      quantity: dto.quantity,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    return { message: 'Cập nhật giỏ hàng thành công' };
+  }
+
+  async removeFromCart(userId: string, productId: string) {
+    const cartRef = this.db
+      .collection('users')
+      .doc(userId)
+      .collection('cart')
+      .doc(productId);
+
+    const cartDoc = await cartRef.get();
+    if (!cartDoc.exists) throw new NotFoundException('Sản phẩm chưa có trong giỏ hàng');
+
+    await cartRef.delete();
+
+    return { message: 'Đã xoá sản phẩm khỏi giỏ hàng' };
+  }
+
+  async getMyCart(userId: string) {
+    const snapshot = await this.db
+      .collection('users')
+      .doc(userId)
+      .collection('cart')
+      .orderBy('updatedAt', 'desc')
+      .get();
+
+    const items = snapshot.docs.map((doc) => ({
+      id: doc.id,
+      ...doc.data(),
+    }));
+
+    const totalAmount = items.reduce((sum: number, item: any) => {
+      return sum + (item.priceSnapshot ?? 0) * (item.quantity ?? 0);
+    }, 0);
+
+    return {
+      totalItems: items.length,
+      totalAmount,
+      items,
+    };
+  }
+
+  async addToFavorites(userId: string, productId: string) {
+    const product = await this.getProductById(productId);
+
+    const favoriteRef = this.db
+      .collection('users')
+      .doc(userId)
+      .collection('favorites')
+      .doc(productId);
+
+    await favoriteRef.set({
+      productId,
+      productNameSnapshot: product.name,
+      priceSnapshot: product.price,
+      imageSnapshot: product.imageUrls?.[0] ?? null,
+      categorySnapshot: product.category ?? null,
+      isActiveSnapshot: product.isActive ?? true,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    return { message: 'Đã thêm vào yêu thích' };
+  }
+
+  async removeFromFavorites(userId: string, productId: string) {
+    const favoriteRef = this.db
+      .collection('users')
+      .doc(userId)
+      .collection('favorites')
+      .doc(productId);
+
+    const favoriteDoc = await favoriteRef.get();
+    if (!favoriteDoc.exists) throw new NotFoundException('Sản phẩm chưa có trong yêu thích');
+
+    await favoriteRef.delete();
+
+    return { message: 'Đã xoá khỏi yêu thích' };
+  }
+
+  async getMyFavorites(userId: string) {
+    const snapshot = await this.db
+      .collection('users')
+      .doc(userId)
+      .collection('favorites')
+      .orderBy('updatedAt', 'desc')
+      .get();
+
+    const items = snapshot.docs.map((doc) => ({
+      id: doc.id,
+      ...doc.data(),
+    }));
+
+    return {
+      total: items.length,
+      items,
     };
   }
 
