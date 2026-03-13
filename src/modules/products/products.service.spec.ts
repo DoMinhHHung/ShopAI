@@ -6,7 +6,17 @@ describe('ProductsService', () => {
 
   beforeEach(async () => {
     const module: TestingModule = await Test.createTestingModule({
-      providers: [ProductsService],
+      providers: [
+        ProductsService,
+        {
+          provide: 'FIREBASE_ADMIN',
+          useValue: {
+            firestore: jest.fn().mockReturnValue({
+              collection: jest.fn(),
+            }),
+          },
+        },
+      ],
     }).compile();
 
     service = module.get<ProductsService>(ProductsService);
